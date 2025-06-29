@@ -607,10 +607,15 @@ def start_training(
     gr.Info(f"Generated sample_prompts.txt")
 
     # Train
+    # Create log file path
+    log_file_path = resolve_path_without_quotes(f"outputs/{output_name}/training.log")
+    
     if sys.platform == "win32":
-        command = sh_filepath
+        # Windows: Use PowerShell's Tee-Object for dual output
+        command = f"powershell -Command \"{sh_filepath} 2>&1 | Tee-Object -FilePath '{log_file_path}'\""
     else:
-        command = f"bash \"{sh_filepath}\""
+        # Linux/Mac: Use tee command for dual output to file and stdout
+        command = f"bash \"{sh_filepath}\" 2>&1 | tee \"{log_file_path}\""
 
     # Use Popen to run the command and capture output in real-time
     env = os.environ.copy()
@@ -618,9 +623,12 @@ def start_training(
     env['LOG_LEVEL'] = 'DEBUG'
     runner = LogsViewRunner()
     cwd = os.path.dirname(os.path.abspath(__file__))
-    gr.Info(f"Started training")
+    gr.Info(f"Started training. Log file: {log_file_path}")
     yield from runner.run_command([command], cwd=cwd)
     yield runner.log(f"Runner: {runner}")
+    
+    # Log completion message
+    gr.Info(f"Training logs saved to: {log_file_path}")
 
     # Generate Readme
     config = toml.loads(train_config)
