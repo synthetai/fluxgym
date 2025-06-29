@@ -556,14 +556,29 @@ keep_tokens = 1
   num_repeats = {num_repeats}"""
     return toml
 
-def update_total_steps(max_train_epochs, num_repeats, images):
+def update_total_steps(max_train_epochs, num_repeats, images, lora_name=None):
     try:
-        num_images = len(images)
+        num_images = 0
+        
+        # 首先尝试从上传的文件中获取图片数量
+        if images and len(images) > 0:
+            num_images = len([img for img in images if not img.endswith('.txt')])
+        
+        # 如果没有上传文件，尝试从预设数据集中获取图片数量
+        elif lora_name:
+            output_name = slugify(lora_name)
+            dataset_path = resolve_path_without_quotes(f"datasets/{output_name}")
+            if os.path.exists(dataset_path):
+                for file in os.listdir(dataset_path):
+                    if file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp')):
+                        num_images += 1
+        
         total_steps = max_train_epochs * num_images * num_repeats
         print(f"max_train_epochs={max_train_epochs} num_images={num_images}, num_repeats={num_repeats}, total_steps={total_steps}")
         return gr.update(value = total_steps)
-    except:
-        print("")
+    except Exception as e:
+        print(f"Error calculating total steps: {e}")
+        return gr.update(value = 0)
 
 def set_repo(lora_rows):
     selected_name = os.path.basename(lora_rows)
@@ -731,10 +746,10 @@ def loaded():
 def update_sample(concept_sentence):
     return gr.update(value=concept_sentence)
 
-def check_predefined_dataset(lora_name):
-    """检查是否存在预设的数据集目录"""
+def check_predefined_dataset(lora_name, max_train_epochs, num_repeats):
+    """检查是否存在预设的数据集目录并计算训练步数"""
     if not lora_name:
-        return gr.update(visible=False)
+        return gr.update(visible=False), gr.update(value=0)
     
     output_name = slugify(lora_name)
     dataset_path = resolve_path_without_quotes(f"datasets/{output_name}")
@@ -747,10 +762,44 @@ def check_predefined_dataset(lora_name):
                 image_files.append(file)
         
         if len(image_files) > 0:
+            # 计算训练步数
+            total_steps = max_train_epochs * len(image_files) * num_repeats
             gr.Info(f"Found predefined dataset with {len(image_files)} images in datasets/{output_name}/")
-            return gr.update(visible=True)
+            print(f"Predefined dataset: max_train_epochs={max_train_epochs}, num_images={len(image_files)}, num_repeats={num_repeats}, total_steps={total_steps}")
+            return gr.update(visible=True), gr.update(value=total_steps)
     
-    return gr.update(visible=False)
+    return gr.update(visible=False), gr.update(value=0)
+
+def update_training_parameters(lora_name, max_train_epochs, num_repeats, images):
+    """统一处理训练参数更新，包括预设数据集检查和步数计算"""
+    if not lora_name:
+        return gr.update(visible=False), gr.update(value=0)
+    
+    output_name = slugify(lora_name)
+    dataset_path = resolve_path_without_quotes(f"datasets/{output_name}")
+    has_predefined_dataset = False
+    
+    # 检查预设数据集
+    if os.path.exists(dataset_path):
+        image_files = [f for f in os.listdir(dataset_path) 
+                      if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp'))]
+        if len(image_files) > 0:
+            has_predefined_dataset = True
+            total_steps = max_train_epochs * len(image_files) * num_repeats
+            gr.Info(f"Found predefined dataset with {len(image_files)} images in datasets/{output_name}/")
+            print(f"Predefined dataset: max_train_epochs={max_train_epochs}, num_images={len(image_files)}, num_repeats={num_repeats}, total_steps={total_steps}")
+            return gr.update(visible=True), gr.update(value=total_steps)
+    
+    # 如果没有预设数据集，处理上传的文件
+    num_images = 0
+    if images and len(images) > 0:
+        num_images = len([img for img in images if not img.endswith('.txt')])
+        total_steps = max_train_epochs * num_images * num_repeats
+        print(f"Uploaded images: max_train_epochs={max_train_epochs}, num_images={num_images}, num_repeats={num_repeats}, total_steps={total_steps}")
+        return gr.update(visible=True), gr.update(value=total_steps)
+    
+    # 如果既没有预设数据集也没有上传文件
+    return gr.update(visible=False), gr.update(value=0)
 
 def refresh_publish_tab():
     loras = get_loras()
@@ -1126,33 +1175,27 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         hide_captioning,
         outputs=[captioning_area, start]
     )
-    max_train_epochs.change(
-        fn=update_total_steps,
-        inputs=[max_train_epochs, num_repeats, images],
-        outputs=[total_steps]
-    )
-    num_repeats.change(
-        fn=update_total_steps,
-        inputs=[max_train_epochs, num_repeats, images],
-        outputs=[total_steps]
-    )
+# max_train_epochs 和 num_repeats 的变化事件将在后面统一处理
     images.upload(
-        fn=update_total_steps,
-        inputs=[max_train_epochs, num_repeats, images],
-        outputs=[total_steps]
+        fn=update_training_parameters,
+        inputs=[lora_name, max_train_epochs, num_repeats, images],
+        outputs=[start, total_steps]
     )
     images.delete(
-        fn=update_total_steps,
-        inputs=[max_train_epochs, num_repeats, images],
-        outputs=[total_steps]
+        fn=update_training_parameters,
+        inputs=[lora_name, max_train_epochs, num_repeats, images],
+        outputs=[start, total_steps]
     )
     images.clear(
-        fn=update_total_steps,
-        inputs=[max_train_epochs, num_repeats, images],
-        outputs=[total_steps]
+        fn=update_training_parameters,
+        inputs=[lora_name, max_train_epochs, num_repeats, images],
+        outputs=[start, total_steps]
     )
     concept_sentence.change(fn=update_sample, inputs=[concept_sentence], outputs=sample_prompts)
-    lora_name.change(fn=check_predefined_dataset, inputs=[lora_name], outputs=[start])
+    # 统一处理所有参数变化事件
+    lora_name.change(fn=update_training_parameters, inputs=[lora_name, max_train_epochs, num_repeats, images], outputs=[start, total_steps])
+    max_train_epochs.change(fn=update_training_parameters, inputs=[lora_name, max_train_epochs, num_repeats, images], outputs=[start, total_steps])
+    num_repeats.change(fn=update_training_parameters, inputs=[lora_name, max_train_epochs, num_repeats, images], outputs=[start, total_steps])
     start.click(fn=create_dataset, inputs=[dataset_folder, resolution, images] + caption_list, outputs=dataset_folder).then(
         fn=start_training,
         inputs=[
