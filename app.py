@@ -231,7 +231,30 @@ def resize_image(image_path, output_path, size):
 
 def create_dataset(destination_folder, size, *inputs):
     print("Creating dataset")
-    images = inputs[0]
+    images = inputs[0] if inputs and inputs[0] else []
+    
+    # 如果没有上传的图片，检查是否存在预设数据集
+    if not images or len(images) == 0:
+        if os.path.exists(destination_folder):
+            # 检查预设数据集目录中的图片
+            existing_images = []
+            for file in os.listdir(destination_folder):
+                if file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp')):
+                    existing_images.append(os.path.join(destination_folder, file))
+            
+            if len(existing_images) > 0:
+                print(f"Using predefined dataset with {len(existing_images)} images in {destination_folder}")
+                # 对现有图片进行缩放处理
+                for image_path in existing_images:
+                    resize_image(image_path, image_path, size)
+                return destination_folder
+        
+        # 如果既没有上传图片，也没有预设数据集，创建空目录
+        if not os.path.exists(destination_folder):
+            os.makedirs(destination_folder)
+        return destination_folder
+    
+    # 原有的上传图片处理逻辑
     if not os.path.exists(destination_folder):
         os.makedirs(destination_folder)
 
@@ -708,6 +731,27 @@ def loaded():
 def update_sample(concept_sentence):
     return gr.update(value=concept_sentence)
 
+def check_predefined_dataset(lora_name):
+    """检查是否存在预设的数据集目录"""
+    if not lora_name:
+        return gr.update(visible=False)
+    
+    output_name = slugify(lora_name)
+    dataset_path = resolve_path_without_quotes(f"datasets/{output_name}")
+    
+    if os.path.exists(dataset_path):
+        # 检查目录中是否有图片文件
+        image_files = []
+        for file in os.listdir(dataset_path):
+            if file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp')):
+                image_files.append(file)
+        
+        if len(image_files) > 0:
+            gr.Info(f"Found predefined dataset with {len(image_files)} images in datasets/{output_name}/")
+            return gr.update(visible=True)
+    
+    return gr.update(visible=False)
+
 def refresh_publish_tab():
     loras = get_loras()
     return gr.Dropdown(label="Trained LoRAs", choices=loras)
@@ -1108,6 +1152,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         outputs=[total_steps]
     )
     concept_sentence.change(fn=update_sample, inputs=[concept_sentence], outputs=sample_prompts)
+    lora_name.change(fn=check_predefined_dataset, inputs=[lora_name], outputs=[start])
     start.click(fn=create_dataset, inputs=[dataset_folder, resolution, images] + caption_list, outputs=dataset_folder).then(
         fn=start_training,
         inputs=[
@@ -1124,4 +1169,4 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
     refresh.click(update, inputs=listeners, outputs=[train_script, train_config, dataset_folder])
 if __name__ == "__main__":
     cwd = os.path.dirname(os.path.abspath(__file__))
-    demo.launch(debug=True, show_error=True, allowed_paths=[cwd])
+    demo.launch(debug=True, show_error=True, allowed_paths=[cwd], server_name="0.0.0.0")
