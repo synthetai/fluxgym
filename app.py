@@ -908,6 +908,25 @@ def update_training_parameters(lora_name, max_train_epochs, num_repeats, images)
     # 如果既没有预设数据集也没有上传文件
     return gr.update(visible=False), gr.update(value=0)
 
+def stop_training():
+    """停止当前训练"""
+    global training_in_progress
+    
+    with training_lock:
+        if not training_in_progress:
+            gr.Info("No training is currently running.")
+            return gr.update(visible=True), gr.update(visible=False)  # 显示开始按钮，隐藏停止按钮
+        
+        killed_pids = kill_existing_training_processes()
+        if killed_pids:
+            gr.Info(f"Stopped training processes: {killed_pids}")
+        else:
+            gr.Info("No training processes found to stop.")
+        
+        training_in_progress = False
+        
+    return gr.update(visible=True), gr.update(visible=False)  # 显示开始按钮，隐藏停止按钮
+
 def refresh_publish_tab():
     loras = get_loras()
     return gr.Dropdown(label="Trained LoRAs", choices=loras)
@@ -1310,25 +1329,6 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
     do_captioning.click(fn=run_captioning, inputs=[images, concept_sentence] + caption_list, outputs=caption_list)
     demo.load(fn=loaded, js=js, outputs=[hf_token, hf_login, hf_logout, repo_owner])
     refresh.click(update, inputs=listeners, outputs=[train_script, train_config, dataset_folder])
-
-def stop_training():
-    """停止当前训练"""
-    global training_in_progress
-    
-    with training_lock:
-        if not training_in_progress:
-            gr.Info("No training is currently running.")
-            return gr.update(visible=True), gr.update(visible=False)  # 显示开始按钮，隐藏停止按钮
-        
-        killed_pids = kill_existing_training_processes()
-        if killed_pids:
-            gr.Info(f"Stopped training processes: {killed_pids}")
-        else:
-            gr.Info("No training processes found to stop.")
-        
-        training_in_progress = False
-        
-    return gr.update(visible=True), gr.update(visible=False)  # 显示开始按钮，隐藏停止按钮
 
 if __name__ == "__main__":
     cwd = os.path.dirname(os.path.abspath(__file__))
