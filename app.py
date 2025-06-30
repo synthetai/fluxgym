@@ -15,13 +15,22 @@ import yaml
 from slugify import slugify
 from transformers import AutoProcessor, AutoModelForCausalLM
 from gradio_logsview import LogsView, LogsViewRunner
-from huggingface_hub import hf_hub_download, HfApi
+from huggingface_hub import hf_hub_download, HfApi, whoami
 from library import flux_train_utils, huggingface_util
 from argparse import Namespace
 import train_network
 import toml
 import re
+import signal
+import psutil
+import threading
+import time
 MAX_IMAGES = 150
+
+# 全局变量跟踪训练状态
+current_training_process = None
+training_lock = threading.Lock()
+training_in_progress = False
 
 with open('models.yaml', 'r') as file:
     models = yaml.safe_load(file)
@@ -604,6 +613,22 @@ def get_samples(lora_name):
     except:
         return []
 
+def kill_existing_training_processes():
+    """终止所有现有的训练进程"""
+    killed_pids = []
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            cmdline = ' '.join(proc.info['cmdline']) if proc.info['cmdline'] else ''
+            if ('flux_train_network.py' in cmdline or 
+                'accelerate launch' in cmdline or 
+                'train.sh' in cmdline):
+                proc.kill()
+                killed_pids.append(proc.info['pid'])
+                print(f"Killed training process: PID {proc.info['pid']}")
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+    return killed_pids
+
 def start_training(
     base_model,
     lora_name,
@@ -611,79 +636,161 @@ def start_training(
     train_config,
     sample_prompts,
 ):
-    # write custom script and toml
-    if not os.path.exists("models"):
-        os.makedirs("models", exist_ok=True)
-    if not os.path.exists("outputs"):
-        os.makedirs("outputs", exist_ok=True)
-    output_name = slugify(lora_name)
-    output_dir = resolve_path_without_quotes(f"outputs/{output_name}")
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
-
-    download(base_model)
-
-    file_type = "sh"
-    if sys.platform == "win32":
-        file_type = "bat"
-
-    sh_filename = f"train.{file_type}"
-    sh_filepath = resolve_path_without_quotes(f"outputs/{output_name}/{sh_filename}")
-    with open(sh_filepath, 'w', encoding="utf-8") as file:
-        file.write(train_script)
-    gr.Info(f"Generated train script at {sh_filename}")
-
-
-    dataset_path = resolve_path_without_quotes(f"outputs/{output_name}/dataset.toml")
-    with open(dataset_path, 'w', encoding="utf-8") as file:
-        file.write(train_config)
-    gr.Info(f"Generated dataset.toml")
-
-    sample_prompts_path = resolve_path_without_quotes(f"outputs/{output_name}/sample_prompts.txt")
-    with open(sample_prompts_path, 'w', encoding='utf-8') as file:
-        file.write(sample_prompts)
-    gr.Info(f"Generated sample_prompts.txt")
-
-    # Train
-    # Create log file path
-    log_file_path = resolve_path_without_quotes(f"outputs/{output_name}/training.log")
+    global current_training_process, training_in_progress
     
-    if sys.platform == "win32":
-        # Windows: Use PowerShell's Tee-Object for dual output
-        command = f"powershell -Command \"{sh_filepath} 2>&1 | Tee-Object -FilePath '{log_file_path}'\""
-    else:
-        # Linux/Mac: Use tee command for dual output to file and stdout
-        command = f"bash \"{sh_filepath}\" 2>&1 | tee \"{log_file_path}\""
+    # 检查是否已有训练在进行
+    with training_lock:
+        if training_in_progress:
+            gr.Warning("Training is already in progress! Stopping existing training first...")
+            killed_pids = kill_existing_training_processes()
+            if killed_pids:
+                gr.Info(f"Stopped existing training processes: {killed_pids}")
+            time.sleep(2)  # 等待进程完全终止
+        
+        training_in_progress = True
 
-    # Use Popen to run the command and capture output in real-time
-    env = os.environ.copy()
-    env['PYTHONIOENCODING'] = 'utf-8'
-    env['LOG_LEVEL'] = 'DEBUG'
-    runner = LogsViewRunner()
-    cwd = os.path.dirname(os.path.abspath(__file__))
-    gr.Info(f"Started training. Log file: {log_file_path}")
-    yield from runner.run_command([command], cwd=cwd)
-    yield runner.log(f"Runner: {runner}")
+    try:
+        # write custom script and toml
+        if not os.path.exists("models"):
+            os.makedirs("models", exist_ok=True)
+        if not os.path.exists("outputs"):
+            os.makedirs("outputs", exist_ok=True)
+        output_name = slugify(lora_name)
+        output_dir = resolve_path_without_quotes(f"outputs/{output_name}")
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+
+        download(base_model)
+
+        file_type = "sh"
+        if sys.platform == "win32":
+            file_type = "bat"
+
+        sh_filename = f"train.{file_type}"
+        sh_filepath = resolve_path_without_quotes(f"outputs/{output_name}/{sh_filename}")
+        with open(sh_filepath, 'w', encoding="utf-8") as file:
+            file.write(train_script)
+        gr.Info(f"Generated train script at {sh_filename}")
+
+        dataset_path = resolve_path_without_quotes(f"outputs/{output_name}/dataset.toml")
+        with open(dataset_path, 'w', encoding="utf-8") as file:
+            file.write(train_config)
+        gr.Info(f"Generated dataset.toml")
+
+        sample_prompts_path = resolve_path_without_quotes(f"outputs/{output_name}/sample_prompts.txt")
+        with open(sample_prompts_path, 'w', encoding='utf-8') as file:
+            file.write(sample_prompts)
+        gr.Info(f"Generated sample_prompts.txt")
+
+        # Train
+        # Create log file path
+        log_file_path = resolve_path_without_quotes(f"outputs/{output_name}/training.log")
+        
+        if sys.platform == "win32":
+            # Windows: Use PowerShell's Tee-Object for dual output
+            command = f"powershell -Command \"{sh_filepath} 2>&1 | Tee-Object -FilePath '{log_file_path}'\""
+        else:
+            # Linux/Mac: Use tee command for dual output to file and stdout
+            command = f"bash \"{sh_filepath}\" 2>&1 | tee \"{log_file_path}\""
+
+        # Use Popen to run the command and capture output in real-time
+        env = os.environ.copy()
+        env['PYTHONIOENCODING'] = 'utf-8'
+        env['LOG_LEVEL'] = 'DEBUG'
+        runner = LogsViewRunner()
+        cwd = os.path.dirname(os.path.abspath(__file__))
+        gr.Info(f"Started training. Log file: {log_file_path}")
+        
+        # 在开始训练时切换按钮状态
+        yield gr.update(visible=False), gr.update(visible=True)  # 隐藏开始按钮，显示停止按钮
+        
+        yield from runner.run_command([command], cwd=cwd)
+        yield runner.log(f"Runner: {runner}")
+        
+        # Log completion message
+        gr.Info(f"Training logs saved to: {log_file_path}")
+
+        # Generate Readme
+        config = toml.loads(train_config)
+        concept_sentence = config['datasets'][0]['subsets'][0]['class_tokens']
+        print(f"concept_sentence={concept_sentence}")
+        print(f"lora_name {lora_name}, concept_sentence={concept_sentence}, output_name={output_name}")
+        sample_prompts_path = resolve_path_without_quotes(f"outputs/{output_name}/sample_prompts.txt")
+        with open(sample_prompts_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        sample_prompts = [line.strip() for line in lines if len(line.strip()) > 0 and line[0] != "#"]
+        md = readme(base_model, lora_name, concept_sentence, sample_prompts)
+        readme_path = resolve_path_without_quotes(f"outputs/{output_name}/README.md")
+        with open(readme_path, "w", encoding="utf-8") as f:
+            f.write(md)
+
+        gr.Info(f"Training Complete. Check the outputs folder for the LoRA files.", duration=None)
+        
+    finally:
+        # 确保训练状态被重置
+        with training_lock:
+            training_in_progress = False
+            current_training_process = None
+
+def start_training_with_button_control(*args):
+    """启动训练并控制按钮状态"""
+    global training_in_progress
     
-    # Log completion message
-    gr.Info(f"Training logs saved to: {log_file_path}")
-
-    # Generate Readme
-    config = toml.loads(train_config)
-    concept_sentence = config['datasets'][0]['subsets'][0]['class_tokens']
-    print(f"concept_sentence={concept_sentence}")
-    print(f"lora_name {lora_name}, concept_sentence={concept_sentence}, output_name={output_name}")
-    sample_prompts_path = resolve_path_without_quotes(f"outputs/{output_name}/sample_prompts.txt")
-    with open(sample_prompts_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    sample_prompts = [line.strip() for line in lines if len(line.strip()) > 0 and line[0] != "#"]
-    md = readme(base_model, lora_name, concept_sentence, sample_prompts)
-    readme_path = resolve_path_without_quotes(f"outputs/{output_name}/README.md")
-    with open(readme_path, "w", encoding="utf-8") as f:
-        f.write(md)
-
-    gr.Info(f"Training Complete. Check the outputs folder for the LoRA files.", duration=None)
-
+    # 解析参数：dataset_folder, resolution, images, caption_list..., base_model, lora_name, train_script, train_config, sample_prompts
+    dataset_folder = args[0]
+    resolution = args[1]
+    images = args[2]
+    
+    # 最后5个参数是固定的
+    base_model = args[-5]
+    lora_name = args[-4]
+    train_script = args[-3]
+    train_config = args[-2]
+    sample_prompts = args[-1]
+    
+    # 中间的是caption_list
+    caption_list = args[3:-5]
+    
+    # 检查是否已有训练在进行
+    with training_lock:
+        if training_in_progress:
+            gr.Warning("Training is already in progress!")
+            return gr.update(visible=False), gr.update(visible=True)  # 保持当前状态
+        
+        training_in_progress = True
+    
+    # 首先创建数据集
+    try:
+        create_dataset(dataset_folder, resolution, images, *caption_list)
+    except Exception as e:
+        gr.Error(f"Failed to create dataset: {e}")
+        with training_lock:
+            training_in_progress = False
+        return gr.update(visible=True), gr.update(visible=False)
+    
+    # 切换按钮状态：隐藏开始按钮，显示停止按钮
+    button_update = gr.update(visible=False), gr.update(visible=True)
+    
+    # 在后台启动训练
+    def run_training():
+        try:
+            # 调用原始的训练函数，但不使用yield（在后台运行）
+            for _ in start_training(base_model, lora_name, train_script, train_config, sample_prompts):
+                pass  # 消费generator但不输出到UI
+        except Exception as e:
+            print(f"Training error: {e}")
+        finally:
+            # 训练完成后重置状态
+            with training_lock:
+                global training_in_progress
+                training_in_progress = False
+    
+    # 在新线程中启动训练
+    training_thread = threading.Thread(target=run_training)
+    training_thread.daemon = True
+    training_thread.start()
+    
+    return button_update
 
 def update(
     base_model,
@@ -1079,7 +1186,9 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
         """, elem_classes="group_padding")
                     refresh = gr.Button("Refresh", elem_id="refresh", visible=False)
                     start = gr.Button("Start training", visible=False, elem_id="start_training")
+                    stop = gr.Button("Stop training", visible=False, elem_id="stop_training", variant="stop")
                     output_components.append(start)
+                    output_components.append(stop)
                     train_script = gr.Textbox(label="Train script", max_lines=100, interactive=True)
                     train_config = gr.Textbox(label="Train config", max_lines=100, interactive=True)
             with gr.Accordion("Advanced options", elem_id='advanced_options', open=False):
@@ -1196,20 +1305,31 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
     lora_name.change(fn=update_training_parameters, inputs=[lora_name, max_train_epochs, num_repeats, images], outputs=[start, total_steps])
     max_train_epochs.change(fn=update_training_parameters, inputs=[lora_name, max_train_epochs, num_repeats, images], outputs=[start, total_steps])
     num_repeats.change(fn=update_training_parameters, inputs=[lora_name, max_train_epochs, num_repeats, images], outputs=[start, total_steps])
-    start.click(fn=create_dataset, inputs=[dataset_folder, resolution, images] + caption_list, outputs=dataset_folder).then(
-        fn=start_training,
-        inputs=[
-            base_model,
-            lora_name,
-            train_script,
-            train_config,
-            sample_prompts,
-        ],
-        outputs=terminal,
-    )
+    start.click(fn=start_training_with_button_control, inputs=[dataset_folder, resolution, images] + caption_list + [base_model, lora_name, train_script, train_config, sample_prompts], outputs=[start, stop])
+    stop.click(fn=stop_training, outputs=[start, stop])
     do_captioning.click(fn=run_captioning, inputs=[images, concept_sentence] + caption_list, outputs=caption_list)
     demo.load(fn=loaded, js=js, outputs=[hf_token, hf_login, hf_logout, repo_owner])
     refresh.click(update, inputs=listeners, outputs=[train_script, train_config, dataset_folder])
+
+def stop_training():
+    """停止当前训练"""
+    global training_in_progress
+    
+    with training_lock:
+        if not training_in_progress:
+            gr.Info("No training is currently running.")
+            return gr.update(visible=True), gr.update(visible=False)  # 显示开始按钮，隐藏停止按钮
+        
+        killed_pids = kill_existing_training_processes()
+        if killed_pids:
+            gr.Info(f"Stopped training processes: {killed_pids}")
+        else:
+            gr.Info("No training processes found to stop.")
+        
+        training_in_progress = False
+        
+    return gr.update(visible=True), gr.update(visible=False)  # 显示开始按钮，隐藏停止按钮
+
 if __name__ == "__main__":
     cwd = os.path.dirname(os.path.abspath(__file__))
     demo.launch(debug=True, show_error=True, allowed_paths=[cwd], server_name="0.0.0.0")
