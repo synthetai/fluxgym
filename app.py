@@ -25,6 +25,9 @@ import signal
 import psutil
 import threading
 import time
+import gc
+import copy
+
 MAX_IMAGES = 150
 
 # 全局变量跟踪训练状态
@@ -442,14 +445,11 @@ def gen_sh(
 
 
     ############# Optimizer args ########################
-#    if vram == "8G":
-#        optimizer = f"""--optimizer_type adafactor {line_break}
-#    --optimizer_args "relative_step=False" "scale_parameter=False" "warmup_init=False" {line_break}
-#        --split_mode {line_break}
-#        --network_args "train_blocks=single" {line_break}
-#        --lr_scheduler constant_with_warmup {line_break}
-#        --max_grad_norm 0.0 {line_break}"""
-    if vram == "16G":
+    if vram == "24G":
+        # 24G VRAM - 最优配置
+        optimizer = f"""--optimizer_type adamw8bit {line_break}
+  --gradient_accumulation_steps 2 {line_break}"""
+    elif vram == "16G":
         # 16G VRAM
         optimizer = f"""--optimizer_type adafactor {line_break}
   --optimizer_args "relative_step=False" "scale_parameter=False" "warmup_init=False" {line_break}
@@ -484,7 +484,7 @@ def gen_sh(
     ae_path = resolve_path("models/vae/ae.sft")
     sh = f"""accelerate launch {line_break}
   --mixed_precision bf16 {line_break}
-  --num_cpu_threads_per_process 1 {line_break}
+  --num_cpu_threads_per_process 4 {line_break}
   sd-scripts/flux_train_network.py {line_break}
   --pretrained_model_name_or_path {pretrained_model_path} {line_break}
   --clip_l {clip_path} {line_break}
@@ -547,7 +547,8 @@ def gen_toml(
   dataset_folder,
   resolution,
   class_tokens,
-  num_repeats
+  num_repeats,
+  batch_size=1
 ):
     toml = f"""[general]
 shuffle_caption = false
@@ -556,7 +557,7 @@ keep_tokens = 1
 
 [[datasets]]
 resolution = {resolution}
-batch_size = 1
+batch_size = {batch_size}
 keep_tokens = 1
 
   [[datasets.subsets]]
@@ -701,11 +702,11 @@ def start_training(
         cwd = os.path.dirname(os.path.abspath(__file__))
         gr.Info(f"Started training. Log file: {log_file_path}")
         
-        # 在开始训练时切换按钮状态
-        yield gr.update(visible=False), gr.update(visible=True)  # 隐藏开始按钮，显示停止按钮
+        # 包装runner的输出，添加按钮状态
+        for log_output in runner.run_command([command], cwd=cwd):
+            yield log_output, gr.update(), gr.update()  # terminal更新，按钮状态不变
         
-        yield from runner.run_command([command], cwd=cwd)
-        yield runner.log(f"Runner: {runner}")
+        yield runner.log(f"Runner: {runner}"), gr.update(), gr.update()
         
         # Log completion message
         gr.Info(f"Training logs saved to: {log_file_path}")
@@ -726,71 +727,14 @@ def start_training(
 
         gr.Info(f"Training Complete. Check the outputs folder for the LoRA files.", duration=None)
         
+        # 训练完成后恢复按钮状态
+        yield gr.update(), gr.update(visible=True), gr.update(visible=False)  # terminal不变，显示开始按钮，隐藏停止按钮
+        
     finally:
         # 确保训练状态被重置
         with training_lock:
             training_in_progress = False
             current_training_process = None
-
-def start_training_with_button_control(*args):
-    """启动训练并控制按钮状态"""
-    global training_in_progress
-    
-    # 解析参数：dataset_folder, resolution, images, caption_list..., base_model, lora_name, train_script, train_config, sample_prompts
-    dataset_folder = args[0]
-    resolution = args[1]
-    images = args[2]
-    
-    # 最后5个参数是固定的
-    base_model = args[-5]
-    lora_name = args[-4]
-    train_script = args[-3]
-    train_config = args[-2]
-    sample_prompts = args[-1]
-    
-    # 中间的是caption_list
-    caption_list = args[3:-5]
-    
-    # 检查是否已有训练在进行
-    with training_lock:
-        if training_in_progress:
-            gr.Warning("Training is already in progress!")
-            return gr.update(visible=False), gr.update(visible=True)  # 保持当前状态
-        
-        training_in_progress = True
-    
-    # 首先创建数据集
-    try:
-        create_dataset(dataset_folder, resolution, images, *caption_list)
-    except Exception as e:
-        gr.Error(f"Failed to create dataset: {e}")
-        with training_lock:
-            training_in_progress = False
-        return gr.update(visible=True), gr.update(visible=False)
-    
-    # 切换按钮状态：隐藏开始按钮，显示停止按钮
-    button_update = gr.update(visible=False), gr.update(visible=True)
-    
-    # 在后台启动训练
-    def run_training():
-        try:
-            # 调用原始的训练函数，但不使用yield（在后台运行）
-            for _ in start_training(base_model, lora_name, train_script, train_config, sample_prompts):
-                pass  # 消费generator但不输出到UI
-        except Exception as e:
-            print(f"Training error: {e}")
-        finally:
-            # 训练完成后重置状态
-            with training_lock:
-                global training_in_progress
-                training_in_progress = False
-    
-    # 在新线程中启动训练
-    training_thread = threading.Thread(target=run_training)
-    training_thread.daemon = True
-    training_thread.start()
-    
-    return button_update
 
 def update(
     base_model,
@@ -830,11 +774,16 @@ def update(
         sample_every_n_steps,
         *advanced_components,
     )
+    
+    # 保持batch_size为1，避免内存问题
+    batch_size = 1
+    
     toml = gen_toml(
         dataset_folder,
         resolution,
         class_tokens,
-        num_repeats
+        num_repeats,
+        batch_size
     )
     return gr.update(value=sh), gr.update(value=toml), dataset_folder
 
@@ -907,6 +856,28 @@ def update_training_parameters(lora_name, max_train_epochs, num_repeats, images)
     
     # 如果既没有预设数据集也没有上传文件
     return gr.update(visible=False), gr.update(value=0)
+
+def start_training_process(dataset_folder, resolution, images, *caption_list):
+    """开始训练流程：切换按钮状态并创建数据集"""
+    global training_in_progress
+    
+    # 立即切换按钮状态
+    with training_lock:
+        if training_in_progress:
+            gr.Warning("Training is already in progress!")
+            return dataset_folder, gr.update(visible=False), gr.update(visible=True)
+        training_in_progress = True
+    
+    # 创建数据集
+    try:
+        result_folder = create_dataset(dataset_folder, resolution, images, *caption_list)
+        return result_folder, gr.update(visible=False), gr.update(visible=True)
+    except Exception as e:
+        # 如果创建数据集失败，重置状态
+        with training_lock:
+            training_in_progress = False
+        gr.Error(f"Failed to create dataset: {e}")
+        return dataset_folder, gr.update(visible=True), gr.update(visible=False)
 
 def stop_training():
     """停止当前训练"""
@@ -1149,7 +1120,7 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                     model_names = list(models.keys())
                     print(f"model_names={model_names}")
                     base_model = gr.Dropdown(label="Base model (edit the models.yaml file to add more to this list)", choices=model_names, value=model_names[0])
-                    vram = gr.Radio(["20G", "16G", "12G" ], value="20G", label="VRAM", interactive=True)
+                    vram = gr.Radio(["24G", "20G", "16G", "12G" ], value="24G", label="VRAM", interactive=True)
                     num_repeats = gr.Number(value=10, precision=0, label="Repeat trains per image", interactive=True)
                     max_train_epochs = gr.Number(label="Max Train Epochs", value=16, interactive=True)
                     total_steps = gr.Number(0, interactive=False, label="Expected training steps")
@@ -1215,17 +1186,17 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
                     with gr.Column(min_width=300):
                         seed = gr.Number(label="--seed", info="Seed", value=42, interactive=True)
                     with gr.Column(min_width=300):
-                        workers = gr.Number(label="--max_data_loader_n_workers", info="Number of Workers", value=2, interactive=True)
+                        workers = gr.Number(label="--max_data_loader_n_workers", info="Number of Workers", value=8, interactive=True)
                     with gr.Column(min_width=300):
-                        learning_rate = gr.Textbox(label="--learning_rate", info="Learning Rate", value="8e-4", interactive=True)
+                        learning_rate = gr.Textbox(label="--learning_rate", info="Learning Rate", value="1e-4", interactive=True)
                     with gr.Column(min_width=300):
-                        save_every_n_epochs = gr.Number(label="--save_every_n_epochs", info="Save every N epochs", value=4, interactive=True)
+                        save_every_n_epochs = gr.Number(label="--save_every_n_epochs", info="Save every N epochs", value=8, interactive=True)
                     with gr.Column(min_width=300):
                         guidance_scale = gr.Number(label="--guidance_scale", info="Guidance Scale", value=1.0, interactive=True)
                     with gr.Column(min_width=300):
                         timestep_sampling = gr.Textbox(label="--timestep_sampling", info="Timestep Sampling", value="shift", interactive=True)
                     with gr.Column(min_width=300):
-                        network_dim = gr.Number(label="--network_dim", info="LoRA Rank", value=4, minimum=4, maximum=128, step=4, interactive=True)
+                        network_dim = gr.Number(label="--network_dim", info="LoRA Rank", value=8, minimum=4, maximum=128, step=4, interactive=True)
                     advanced_components, advanced_component_ids = init_advanced()
             with gr.Row():
                 terminal = LogsView(label="Train log", elem_id="terminal")
@@ -1324,11 +1295,23 @@ with gr.Blocks(elem_id="app", theme=theme, css=css, fill_width=True) as demo:
     lora_name.change(fn=update_training_parameters, inputs=[lora_name, max_train_epochs, num_repeats, images], outputs=[start, total_steps])
     max_train_epochs.change(fn=update_training_parameters, inputs=[lora_name, max_train_epochs, num_repeats, images], outputs=[start, total_steps])
     num_repeats.change(fn=update_training_parameters, inputs=[lora_name, max_train_epochs, num_repeats, images], outputs=[start, total_steps])
-    start.click(fn=start_training_with_button_control, inputs=[dataset_folder, resolution, images] + caption_list + [base_model, lora_name, train_script, train_config, sample_prompts], outputs=[start, stop])
+    start.click(fn=start_training_process, inputs=[dataset_folder, resolution, images] + caption_list, outputs=[dataset_folder, start, stop]).then(
+        fn=start_training,
+        inputs=[
+            base_model,
+            lora_name,
+            train_script,
+            train_config,
+            sample_prompts,
+        ],
+        outputs=[terminal, start, stop],
+    )
     stop.click(fn=stop_training, outputs=[start, stop])
     do_captioning.click(fn=run_captioning, inputs=[images, concept_sentence] + caption_list, outputs=caption_list)
     demo.load(fn=loaded, js=js, outputs=[hf_token, hf_login, hf_logout, repo_owner])
     refresh.click(update, inputs=listeners, outputs=[train_script, train_config, dataset_folder])
+
+
 
 if __name__ == "__main__":
     cwd = os.path.dirname(os.path.abspath(__file__))
