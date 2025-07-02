@@ -496,7 +496,6 @@ def gen_sh(
   --max_data_loader_n_workers {workers} {line_break}
   --seed {seed} {line_break}
   --gradient_checkpointing {line_break}
-  --mixed_precision bf16 {line_break}
   --save_precision bf16 {line_break}
   --network_module networks.lora_flux {line_break}
   --network_dim {network_dim} {line_break}
